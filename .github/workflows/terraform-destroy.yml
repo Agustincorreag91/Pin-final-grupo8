@@ -1,0 +1,129 @@
+name: Terraform Destroy Workflow
+on:
+  workflow_dispatch:  # Permite ejecución manual desde GitHub Actions
+
+jobs:
+  destroy:
+    name: Destroy Infrastructure with Terraform
+    runs-on: ubuntu-latest
+    steps:
+      # Paso 1: Checkout del código fuente
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Paso 2: Configurar Terraform CLI
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.8.4
+
+      # Paso 3: Configurar las credenciales de AWS
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      # Paso 4: Inicializar Terraform y refrescar el estado
+      - name: Initialize and Refresh Terraform
+        run: |
+          terraform init
+          terraform refresh
+
+      # Paso 5: Forzar eliminación de recursos bloqueados antes de Terraform Destroy
+      - name: Force Delete AWS Resources
+        run: |
+          echo "🛑 Eliminando manualmente recursos bloqueados..."
+
+          # Detener y eliminar instancias EC2
+          INSTANCE_IDS=$(aws ec2 describe-instances --query "Reservations[*].Instances[*].InstanceId" --output text --region us-east-1)
+          if [[ "$INSTANCE_IDS" != "" ]]; then
+            echo "Apagando y terminando instancias EC2..."
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS --region us-east-1
+            sleep 30  # Esperar que AWS elimine las instancias
+          fi
+
+          # Eliminar Elastic IP si existe
+          ALLOCATION_ID=$(aws ec2 describe-addresses --query "Addresses[0].AllocationId" --output text --region us-east-1)
+          if [[ "$ALLOCATION_ID" != "None" ]]; then
+            echo "Liberando Elastic IP: $ALLOCATION_ID"
+            aws ec2 release-address --allocation-id "$ALLOCATION_ID" --region us-east-1
+          fi
+
+          # Eliminar Security Groups si están vacíos
+          SECURITY_GROUPS=$(aws ec2 describe-security-groups --query "SecurityGroups[*].GroupId" --output text --region us-east-1)
+          for SG in $SECURITY_GROUPS; do
+            if [[ "$SG" != "default" ]]; then
+              echo "Eliminando Security Group: $SG"
+              aws ec2 delete-security-group --group-id "$SG" --region us-east-1 || true
+            fi
+          done
+
+          # Eliminar Internet Gateways
+          IGW_IDS=$(aws ec2 describe-internet-gateways --query "InternetGateways[*].InternetGatewayId" --output text --region us-east-1)
+          for IGW in $IGW_IDS; do
+            echo "Desvinculando y eliminando Internet Gateway: $IGW"
+            VPC_ID=$(aws ec2 describe-internet-gateways --internet-gateway-ids $IGW --query "InternetGateways[0].Attachments[0].VpcId" --output text --region us-east-1)
+            aws ec2 detach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC_ID --region us-east-1 || true
+            aws ec2 delete-internet-gateway --internet-gateway-id $IGW --region us-east-1 || true
+          done
+
+          echo "✅ Recursos eliminados, continuando con Terraform Destroy."
+
+      # Paso 6: Ejecutar Terraform Destroy
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
+
+      # Paso 7: Esperar antes de eliminar el bucket S3
+      - name: Wait before S3 Cleanup
+        run: |
+          echo "⏳ Esperando 10 segundos para permitir que S3 procese las eliminaciones..."
+          sleep 10
+
+      # Paso 8: Vaciar y eliminar el bucket S3
+      - name: Empty and Delete S3 Bucket
+        run: |
+          BUCKET_NAME="pin-grupo-4"
+
+          # Verificar si el bucket existe
+          if aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+            echo "✅ Bucket encontrado, eliminando contenido..."
+
+            # Eliminar objetos del bucket
+            echo "🗑️ Eliminando objetos..."
+            aws s3 rm "s3://$BUCKET_NAME" --recursive --region us-east-1 || true
+
+            # Eliminar versiones de objetos
+            echo "🗑️ Eliminando versiones de objetos..."
+            aws s3api list-object-versions --bucket "$BUCKET_NAME" --query "Versions[].{Key:Key,VersionId:VersionId}" --output json --region us-east-1 | \
+            jq -c '.[]' | while read -r obj; do
+              key=$(echo "$obj" | jq -r '.Key')
+              version=$(echo "$obj" | jq -r '.VersionId')
+              aws s3api delete-object --bucket "$BUCKET_NAME" --key "$key" --version-id "$version" --region us-east-1
+            done
+
+            # Eliminar marcadores de eliminación
+            echo "🗑️ Eliminando marcadores de eliminación..."
+            aws s3api list-object-versions --bucket "$BUCKET_NAME" --query "DeleteMarkers[].{Key:Key,VersionId:VersionId}" --output json --region us-east-1 | \
+            jq -c '.[]' | while read -r obj; do
+              key=$(echo "$obj" | jq -r '.Key')
+              version=$(echo "$obj" | jq -r '.VersionId')
+              aws s3api delete-object --bucket "$BUCKET_NAME" --key "$key" --version-id "$version" --region us-east-1
+            done
+
+            # Esperar antes de eliminar el bucket
+            echo "⏳ Esperando 10 segundos para asegurar que AWS procese las eliminaciones..."
+            sleep 10
+
+            # Intentar eliminar el bucket vacío
+            if aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+              echo "🗑️ Intentando eliminar el bucket vacío..."
+              aws s3api delete-bucket --bucket "$BUCKET_NAME" --region us-east-1
+              echo "✅ Bucket eliminado con éxito."
+            else
+              echo "El bucket no existe o ya fue eliminado."
+            fi
+          else
+            echo "El bucket no existe."
+          fi
