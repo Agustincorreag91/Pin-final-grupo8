@@ -30,7 +30,7 @@ jobs:
         run: |
           if ! aws s3api head-bucket --bucket pinfinal-grupo-8 2>/dev/null; then
             aws s3api create-bucket \
-              --bucket ppinfinal-grupo-8 \
+              --bucket pinfinal-grupo-8 \
               --region us-east-1
             aws s3api put-bucket-versioning \
               --bucket pinfinal-grupo-8 \
