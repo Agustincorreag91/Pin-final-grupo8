@@ -84,7 +84,7 @@ jobs:
       # Paso 8: Vaciar y eliminar el bucket S3
       - name: Empty and Delete S3 Bucket
         run: |
-          BUCKET_NAME="pin-grupo-4"
+          BUCKET_NAME="pinfinal-grupo-8"
 
           # Verificar si el bucket existe
           if aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
